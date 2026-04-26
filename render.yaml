@@ -1,0 +1,12 @@
+# Render.com deploy config — chrome buildpack required
+services:
+  - type: web
+    name: crazytime-scraper
+    runtime: node
+    buildCommand: npm install && npx puppeteer browsers install chrome
+    startCommand: npm start
+    envVars:
+      - key: PUPPETEER_CACHE_DIR
+        value: /opt/render/.cache/puppeteer
+      - key: NODE_VERSION
+        value: 20
