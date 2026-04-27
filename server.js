@@ -1,7 +1,7 @@
 // ═══════════════════════════════════════════════════════════
-//  Crazy Time Live Scraper Server (v3)
-//  Targets: https://trackcasinos.com/crazy-time/
-//  Aggressive image-based detection for table cell results.
+//  Crazy Time Live Scraper Server (v4)
+//  CRITICAL FIX: reads SLOT RESULT (the actual wheel landing)
+//  not "Spin Result" (which is post-bonus payout description).
 // ═══════════════════════════════════════════════════════════
 
 const express = require("express");
@@ -42,65 +42,67 @@ async function scrapeResults() {
 
     console.log(`🔍 Navigating to ${TARGET_URL}...`);
     await page.goto(TARGET_URL, { waitUntil: "networkidle2", timeout: 30000 });
-    await new Promise(r => setTimeout(r, 5000));
+    await new Promise(r => setTimeout(r, 5500));
 
     const data = await page.evaluate(() => {
-      // Aggressive result detection from anything inside a cell
+      // Detect from cell — VERY conservative, requires explicit match
       function detectFromCell(cell) {
         if (!cell) return { result: null, raw: "" };
 
-        // Collect ALL hints from the cell
-        const hints = [];
+        // Gather every clue
+        const clues = [];
         const text = (cell.textContent || "").trim();
-        if (text) hints.push(text);
+        if (text) clues.push("TEXT:" + text);
 
         const imgs = cell.querySelectorAll("img");
         for (const img of imgs) {
-          if (img.alt) hints.push(img.alt);
-          if (img.title) hints.push(img.title);
-          if (img.src) hints.push(img.src);
+          if (img.alt) clues.push("ALT:" + img.alt);
+          if (img.title) clues.push("TITLE:" + img.title);
+          if (img.src) clues.push("SRC:" + img.src);
         }
 
-        // Also check background-image of any child
         const allChildren = cell.querySelectorAll("*");
         for (const c of allChildren) {
           const bg = window.getComputedStyle(c).backgroundImage;
-          if (bg && bg !== "none") hints.push(bg);
+          if (bg && bg !== "none") clues.push("BG:" + bg);
+          if (c.className && typeof c.className === "string" && c.className.length < 100) clues.push("CLS:" + c.className);
           if (c.dataset) {
-            for (const k of Object.keys(c.dataset)) hints.push(c.dataset[k]);
+            for (const k of Object.keys(c.dataset)) clues.push("DATA:" + k + "=" + c.dataset[k]);
           }
-          if (c.className && typeof c.className === "string") hints.push(c.className);
         }
 
-        const combined = hints.join(" | ").toLowerCase();
-        const result = matchResult(combined, text);
-        return { result, raw: hints.slice(0,3).join(" | ").slice(0,150) };
+        const all = clues.join(" || ").toLowerCase();
+        const result = matchResult(all, text);
+        return { result, raw: clues.slice(0, 6).join(" || ").slice(0, 250) };
       }
 
-      function matchResult(combined, originalText) {
-        if (!combined) return null;
+      function matchResult(all, originalText) {
+        if (!all) return null;
 
-        // Bonus games (check first - longer names)
-        if (combined.includes("crazy") && combined.includes("time")) return "Crazy Time";
-        if (combined.includes("crazytime") || combined.includes("crazy_time") || combined.includes("crazy-time")) return "Crazy Time";
-        if (combined.includes("coin") && combined.includes("flip")) return "Coin Flip";
-        if (combined.includes("coinflip") || combined.includes("coin_flip") || combined.includes("coin-flip")) return "Coin Flip";
-        if (combined.includes("cash") && combined.includes("hunt")) return "Cash Hunt";
-        if (combined.includes("cashhunt") || combined.includes("cash_hunt") || combined.includes("cash-hunt")) return "Cash Hunt";
-        if (combined.includes("pachinko")) return "Pachinko";
+        // Bonus games: must have explicit indicator (longer names checked first)
+        if (/(?:^|[^a-z])crazy[\s_-]*time(?:[^a-z]|$)/i.test(all) || /ico-crazytime/.test(all) || /crazytime\b/.test(all)) return "Crazy Time";
+        if (/(?:^|[^a-z])coin[\s_-]*flip(?:[^a-z]|$)/i.test(all) || /ico-coinflip/.test(all) || /coinflip\b/.test(all)) return "Coin Flip";
+        if (/(?:^|[^a-z])cash[\s_-]*hunt(?:[^a-z]|$)/i.test(all) || /ico-cashhunt/.test(all) || /cashhunt\b/.test(all)) return "Cash Hunt";
+        if (/(?:^|[^a-z])pachinko(?:[^a-z]|$)/i.test(all) || /ico-pachinko/.test(all)) return "Pachinko";
 
-        // Numbers - prefer the original cell text
+        // Numbers — STRICT: prefer the cell's plain text first
         if (originalText) {
           const t = originalText.trim();
-          if (/^\s*10\s*$/.test(t)) return "10";
-          if (/^\s*5\s*$/.test(t)) return "5";
-          if (/^\s*2\s*$/.test(t)) return "2";
-          if (/^\s*1\s*$/.test(t)) return "1";
+          if (/^10$/.test(t)) return "10";
+          if (/^5$/.test(t)) return "5";
+          if (/^2$/.test(t)) return "2";
+          if (/^1$/.test(t)) return "1";
         }
 
-        // From src/url filenames
-        const m = combined.match(/(?:^|[^a-z0-9])(10|5|2|1)(?:[^a-z0-9]|$)/);
-        if (m) return m[1];
+        // From src/icon filenames — be strict, require "ico-N" or similar
+        const ico = all.match(/ico-(\d+)/);
+        if (ico && ["1","2","5","10"].includes(ico[1])) return ico[1];
+        // url(.../N.webp) or url(.../N.png)
+        const numUrl = all.match(/\/(\d+)\.(webp|png|svg|jpg)/);
+        if (numUrl && ["1","2","5","10"].includes(numUrl[1])) return numUrl[1];
+        // class name like "result-5" or "spin-10"
+        const clsNum = all.match(/(?:result|slot|spin|seg|num)[-_](\d+)/);
+        if (clsNum && ["1","2","5","10"].includes(clsNum[1])) return clsNum[1];
 
         return null;
       }
@@ -110,46 +112,49 @@ async function scrapeResults() {
       let targetTable = null;
       for (const tbl of tables) {
         const headers = Array.from(tbl.querySelectorAll("th, thead td")).map(h => h.textContent.toLowerCase());
-        if (headers.some(h => h.includes("spin result")) || headers.some(h => h.includes("occurred"))) {
+        if (headers.some(h => h.includes("slot result")) || headers.some(h => h.includes("occurred"))) {
           targetTable = tbl; break;
         }
       }
-      if (!targetTable) return { items: [], debug: { error: "No matching table" }, sample: null };
+      if (!targetTable) return { items: [], debug: { error: "No matching table" }, samples: [] };
 
-      // Find columns
+      // Find columns — PREFER "Slot Result" (the actual wheel landing)
       const headerCells = Array.from(targetTable.querySelectorAll("th, thead td"));
-      let timeCol = -1, spinCol = -1;
+      let timeCol = -1, slotCol = -1, spinCol = -1;
       headerCells.forEach((h, i) => {
         const t = h.textContent.toLowerCase();
         if (t.includes("occurred") || (t.includes("time") && timeCol === -1)) timeCol = i;
-        if (t.includes("spin result")) spinCol = i;
+        if (t.includes("slot result")) slotCol = i;       // ✅ THE ACTUAL RESULT
+        if (t.includes("spin result")) spinCol = i;       // (post-bonus, ignore)
       });
-      if (spinCol === -1) headerCells.forEach((h, i) => { if (h.textContent.toLowerCase().includes("slot result")) spinCol = i; });
+
+      const useCol = slotCol !== -1 ? slotCol : spinCol;
 
       const rows = targetTable.querySelectorAll("tbody tr");
       const out = [];
-      let firstRowSample = null;
+      const samples = [];
 
       for (let i = 0; i < rows.length; i++) {
         const cells = rows[i].querySelectorAll("td");
         if (cells.length === 0) continue;
 
         const timeText = timeCol >= 0 && cells[timeCol] ? cells[timeCol].textContent.trim() : "";
-        const spinCell = spinCol >= 0 ? cells[spinCol] : null;
-        const det = detectFromCell(spinCell);
+        const targetCell = useCol >= 0 ? cells[useCol] : null;
+        const det = detectFromCell(targetCell);
 
-        // Save first row's debug info
-        if (i === 0 && spinCell) {
-          firstRowSample = {
+        // Save first 3 rows as debug samples
+        if (i < 3 && targetCell) {
+          samples.push({
+            rowIdx: i,
             time: timeText,
-            spinCellHTML: spinCell.outerHTML.slice(0, 400),
-            spinCellText: spinCell.textContent.trim(),
-            imgCount: spinCell.querySelectorAll("img").length,
-            firstImgSrc: (spinCell.querySelector("img") || {}).src || "",
-            firstImgAlt: (spinCell.querySelector("img") || {}).alt || "",
+            cellHTML: targetCell.outerHTML.slice(0, 350),
+            cellText: targetCell.textContent.trim(),
+            imgCount: targetCell.querySelectorAll("img").length,
+            firstImgSrc: (targetCell.querySelector("img") || {}).src || "",
+            firstImgAlt: (targetCell.querySelector("img") || {}).alt || "",
             detected: det.result,
-            rawHints: det.raw,
-          };
+            rawClues: det.raw,
+          });
         }
 
         if (det.result) out.push({ result: det.result, time: timeText });
@@ -160,23 +165,24 @@ async function scrapeResults() {
         items: out,
         debug: {
           tableCount: tables.length, rowCount: rows.length,
-          timeCol, spinCol,
+          timeCol, slotCol, spinCol, useCol,
           headers: headerCells.map(h => h.textContent.trim()),
         },
-        sample: firstRowSample,
+        samples,
       };
     });
 
     console.log(`✅ Scraped ${data.items.length} results`);
-    if (data.sample) console.log(`   Sample row:`, JSON.stringify(data.sample));
-    console.log(`   Debug:`, JSON.stringify(data.debug));
+    if (data.samples && data.samples.length) {
+      console.log(`   Samples:`, JSON.stringify(data.samples).slice(0, 800));
+    }
 
     cache = {
       results: data.items,
       lastUpdate: new Date().toISOString(),
       error: data.items.length === 0 ? `No results extracted` : null,
       debug: data.debug,
-      sample: data.sample,
+      samples: data.samples,
     };
   } catch (err) {
     console.error("❌ Scrape failed:", err.message);
@@ -194,13 +200,13 @@ async function autoRefresh() {
   setTimeout(autoRefresh, 8000);
 }
 
-app.get("/", (req, res) => res.json({ status: "ok", target: TARGET_URL }));
+app.get("/", (req, res) => res.json({ status: "ok", target: TARGET_URL, version: "v4" }));
 app.get("/api/results", (req, res) => res.json(cache));
 app.get("/api/refresh", async (req, res) => res.json(await scrapeResults()));
 app.get("/api/health", (req, res) => res.json({ status: "ok", uptime: process.uptime(), lastUpdate: cache.lastUpdate, resultsCount: cache.results.length }));
 
 app.listen(PORT, () => {
-  console.log(`🎰 Crazy Time scraper v3 running on port ${PORT}`);
+  console.log(`🎰 Crazy Time scraper v4 running on port ${PORT}`);
   setTimeout(autoRefresh, 2000);
 });
 
