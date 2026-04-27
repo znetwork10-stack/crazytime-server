@@ -1,11 +1,7 @@
 // ═══════════════════════════════════════════════════════════
-//  Crazy Time Live Scraper Server (v5)
-//  KEY FIX: parses 'ico-crazytime-slot-X' class names correctly:
-//    slot-1, slot-2, slot-5, slot-10 → number
-//    slot-ct → Crazy Time
-//    slot-cf → Coin Flip
-//    slot-ch → Cash Hunt
-//    slot-pa → Pachinko
+//  Crazy Time Live Scraper Server (v6)
+//  NEW SOURCE: https://in.casino.org/india/casinoscores/crazy-time/
+//  Returns rich debug info on first run so we can dial in selectors.
 // ═══════════════════════════════════════════════════════════
 
 const express = require("express");
@@ -14,7 +10,7 @@ const puppeteer = require("puppeteer");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const TARGET_URL = "https://trackcasinos.com/crazy-time/";
+const TARGET_URL = "https://in.casino.org/india/casinoscores/crazy-time/";
 
 app.use(cors());
 app.use(express.json());
@@ -33,6 +29,25 @@ async function getBrowser() {
   return browser;
 }
 
+function mapToken(token) {
+  if (!token) return null;
+  const t = String(token).trim().toLowerCase();
+
+  // Bonus games
+  if (/(crazy[\s_-]*time|crazytime)/.test(t)) return "Crazy Time";
+  if (/(coin[\s_-]*flip|coinflip)/.test(t)) return "Coin Flip";
+  if (/(cash[\s_-]*hunt|cashhunt)/.test(t)) return "Cash Hunt";
+  if (/pachinko/.test(t)) return "Pachinko";
+
+  // Numbers — exact match only
+  if (/^10$/.test(t)) return "10";
+  if (/^5$/.test(t)) return "5";
+  if (/^2$/.test(t)) return "2";
+  if (/^1$/.test(t)) return "1";
+
+  return null;
+}
+
 async function scrapeResults() {
   if (scrapingInProgress) return cache;
   scrapingInProgress = true;
@@ -46,117 +61,174 @@ async function scrapeResults() {
 
     console.log(`🔍 Navigating to ${TARGET_URL}...`);
     await page.goto(TARGET_URL, { waitUntil: "networkidle2", timeout: 30000 });
-    await new Promise(r => setTimeout(r, 5500));
+    await new Promise(r => setTimeout(r, 6000));
 
     const data = await page.evaluate(() => {
-      // PRIMARY DETECTION: parse the slot class name
-      // Examples: "ico-crazytime-slot-1", "ico-crazytime-slot-ct", "ico-crazytime-slot-cf"
-      function detectFromCell(cell) {
-        if (!cell) return { result: null, raw: "" };
-
-        // Look for any element with class containing "ico-crazytime-slot-X"
-        const allEls = cell.querySelectorAll("*");
-        let foundClass = "";
-        for (const el of allEls) {
-          if (el.className && typeof el.className === "string") {
-            const m = el.className.match(/ico-crazytime-slot-([a-z0-9]+)/i);
-            if (m) {
-              foundClass = m[0];
-              const code = m[1].toLowerCase();
-              const result = mapSlotCode(code);
-              if (result) {
-                return { result, raw: foundClass };
-              }
-            }
-          }
-        }
-
-        // Fallback: parse image src for "/slot-X.webp"
-        const imgs = cell.querySelectorAll("img");
-        for (const img of imgs) {
-          const src = img.src || "";
-          const m = src.match(/\/slot-([a-z0-9]+)\.(?:webp|png|svg|jpg)/i);
-          if (m) {
-            const result = mapSlotCode(m[1].toLowerCase());
-            if (result) return { result, raw: src };
-          }
-        }
-
-        // No match
-        return { result: null, raw: cell.textContent.trim().slice(0, 50) };
-      }
-
-      function mapSlotCode(code) {
-        const map = {
-          "1": "1", "2": "2", "5": "5", "10": "10",
-          "ct": "Crazy Time",
-          "cf": "Coin Flip",
-          "ch": "Cash Hunt",
-          "pa": "Pachinko",
-        };
-        return map[code] || null;
-      }
-
-      // Find target table (it has 'Slot Result' header)
-      const tables = document.querySelectorAll("table");
-      let targetTable = null;
-      for (const tbl of tables) {
-        const headers = Array.from(tbl.querySelectorAll("th, thead td")).map(h => h.textContent.toLowerCase());
-        if (headers.some(h => h.includes("slot result"))) {
-          targetTable = tbl; break;
-        }
-      }
-      if (!targetTable) return { items: [], debug: { error: "No matching table" }, samples: [] };
-
-      // Find columns
-      const headerCells = Array.from(targetTable.querySelectorAll("th, thead td"));
-      let timeCol = -1, slotCol = -1;
-      headerCells.forEach((h, i) => {
-        const t = h.textContent.toLowerCase();
-        if (t.includes("occurred") || (t.includes("time") && timeCol === -1)) timeCol = i;
-        if (t.includes("slot result")) slotCol = i;
-      });
-
-      const rows = targetTable.querySelectorAll("tbody tr");
       const out = [];
       const samples = [];
 
-      for (let i = 0; i < rows.length; i++) {
-        const cells = rows[i].querySelectorAll("td");
-        if (cells.length === 0) continue;
+      // Helper: detect from anything
+      function detectFromEl(el) {
+        if (!el) return { result: null, raw: "" };
+        const clues = [];
+        const text = (el.textContent || "").trim();
+        if (text) clues.push(text);
+        if (el.alt) clues.push(el.alt);
+        if (el.title) clues.push(el.title);
+        if (el.src) clues.push(el.src);
+        if (el.className && typeof el.className === "string") clues.push(el.className);
+        if (el.dataset) {
+          for (const k of Object.keys(el.dataset)) clues.push(el.dataset[k]);
+        }
+        // Children
+        const imgs = el.querySelectorAll ? el.querySelectorAll("img") : [];
+        for (const img of imgs) {
+          if (img.alt) clues.push(img.alt);
+          if (img.src) clues.push(img.src);
+        }
+        const allChildren = el.querySelectorAll ? el.querySelectorAll("*") : [];
+        for (const c of allChildren) {
+          if (c.className && typeof c.className === "string" && c.className.length < 80) clues.push(c.className);
+          const bg = window.getComputedStyle(c).backgroundImage;
+          if (bg && bg !== "none") clues.push(bg);
+        }
+        return { result: null, clues: clues.slice(0, 8), raw: clues.slice(0, 4).join(" || ").slice(0, 200) };
+      }
 
-        const timeText = timeCol >= 0 && cells[timeCol] ? cells[timeCol].textContent.trim() : "";
-        const slotCell = slotCol >= 0 ? cells[slotCol] : null;
-        const det = detectFromCell(slotCell);
+      // ==== Strategy 1: Find a results table with Spin/Slot Result column ====
+      const tables = document.querySelectorAll("table");
+      let bestTable = null;
+      for (const tbl of tables) {
+        const headers = Array.from(tbl.querySelectorAll("th, thead td")).map(h => h.textContent.toLowerCase());
+        if (headers.some(h => h.includes("result") || h.includes("spin") || h.includes("slot") || h.includes("outcome"))) {
+          bestTable = tbl;
+          break;
+        }
+      }
 
-        if (i < 3 && slotCell) {
-          samples.push({
-            row: i,
-            time: timeText,
-            cellHTML: slotCell.outerHTML.slice(0, 250),
-            detected: det.result,
-            classFound: det.raw,
-          });
+      if (bestTable) {
+        const headerCells = Array.from(bestTable.querySelectorAll("th, thead td"));
+        const headersStr = headerCells.map(h => h.textContent.trim());
+
+        const rows = bestTable.querySelectorAll("tbody tr");
+        for (let i = 0; i < rows.length; i++) {
+          const cells = Array.from(rows[i].querySelectorAll("td"));
+          if (cells.length === 0) continue;
+
+          // Try every cell to find a result match
+          let foundResult = null, foundIn = -1, foundClues = "";
+          for (let c = 0; c < cells.length; c++) {
+            const det = (function(cell){
+              if (!cell) return null;
+              const els = [cell, ...cell.querySelectorAll("*")];
+              for (const el of els) {
+                const tries = [];
+                if (el.alt) tries.push(el.alt);
+                if (el.title) tries.push(el.title);
+                if (el.src) tries.push(el.src);
+                if (el.className && typeof el.className === "string") tries.push(el.className);
+                if (el.dataset) for (const k of Object.keys(el.dataset)) tries.push(el.dataset[k]);
+                for (const t of tries) {
+                  // From class names like "result-1", "outcome-coinflip", "icon-crazy-time"
+                  const match = String(t).toLowerCase();
+                  if (/crazy[\s_-]*time|crazytime/.test(match)) return "Crazy Time";
+                  if (/coin[\s_-]*flip|coinflip/.test(match)) return "Coin Flip";
+                  if (/cash[\s_-]*hunt|cashhunt/.test(match)) return "Cash Hunt";
+                  if (/pachinko/.test(match)) return "Pachinko";
+                  // From URLs / class endings: -1, -2, -5, -10
+                  const numFromAttr = match.match(/(?:result|outcome|slot|spin|seg|number|num)[-_](\d+)/);
+                  if (numFromAttr && ["1","2","5","10"].includes(numFromAttr[1])) return numFromAttr[1];
+                  const slotFromUrl = match.match(/\/(\d+)\.(webp|png|svg|jpg)/);
+                  if (slotFromUrl && ["1","2","5","10"].includes(slotFromUrl[1])) return slotFromUrl[1];
+                }
+              }
+              // Plain text fallback
+              const text = (cell.textContent || "").trim();
+              if (/^(crazy\s*time|coin\s*flip|cash\s*hunt|pachinko)$/i.test(text)) {
+                if (/crazy/i.test(text)) return "Crazy Time";
+                if (/coin/i.test(text)) return "Coin Flip";
+                if (/cash/i.test(text)) return "Cash Hunt";
+                if (/pachinko/i.test(text)) return "Pachinko";
+              }
+              if (/^(10|5|2|1)$/.test(text)) return text;
+              return null;
+            })(cells[c]);
+            if (det) {
+              foundResult = det;
+              foundIn = c;
+              break;
+            }
+          }
+
+          // Time: usually leftmost column or one labeled "time"/"finished"
+          let timeText = "";
+          const timeIdx = headersStr.findIndex(h => /time|finished|when|occurred/i.test(h));
+          if (timeIdx >= 0 && cells[timeIdx]) {
+            timeText = cells[timeIdx].textContent.trim();
+          } else if (cells[0]) {
+            timeText = cells[0].textContent.trim();
+          }
+
+          if (i < 4) {
+            samples.push({
+              row: i,
+              time: timeText,
+              cellCount: cells.length,
+              cellsHTML: cells.map(c => c.outerHTML.slice(0, 200)),
+              detected: foundResult,
+              detectedInCol: foundIn,
+            });
+          }
+
+          if (foundResult) out.push({ result: foundResult, time: timeText });
+          if (out.length >= 30) break;
         }
 
-        if (det.result) out.push({ result: det.result, time: timeText });
-        if (out.length >= 30) break;
+        return {
+          items: out,
+          debug: {
+            strategy: "table",
+            url: location.href,
+            title: document.title,
+            tableCount: tables.length,
+            rowCount: rows.length,
+            headers: headersStr,
+          },
+          samples,
+        };
+      }
+
+      // ==== Strategy 2: card/list layout (no table) ====
+      // Look for repeated elements that contain result info
+      const candidates = document.querySelectorAll("[class*='result'], [class*='spin'], [class*='outcome'], [class*='history'] > *, [class*='round']");
+      const listSamples = [];
+      for (const c of Array.from(candidates).slice(0, 30)) {
+        const text = (c.textContent || "").trim();
+        if (text.length > 100 || text.length < 1) continue;
+        listSamples.push({ class: c.className, text: text.slice(0, 80), html: c.outerHTML.slice(0, 200) });
+        if (listSamples.length >= 5) break;
       }
 
       return {
-        items: out,
-        debug: { tableCount: tables.length, rowCount: rows.length, timeCol, slotCol },
-        samples,
+        items: [],
+        debug: {
+          strategy: "fallback",
+          url: location.href,
+          title: document.title,
+          tableCount: tables.length,
+          bodyHasText: (document.body.textContent || "").length,
+          listCandidates: candidates.length,
+        },
+        samples: listSamples,
       };
     });
 
     console.log(`✅ Scraped ${data.items.length} results`);
     if (data.items.length > 0) {
-      const summary = data.items.map(r => r.result).join(", ");
-      console.log(`   Results: ${summary}`);
-    }
-    if (data.samples && data.samples.length) {
-      console.log(`   Samples:`, JSON.stringify(data.samples).slice(0, 600));
+      console.log(`   Latest: ${data.items.slice(0, 5).map(r => `${r.result}@${r.time}`).join(" | ")}`);
+    } else {
+      console.log(`   Debug:`, JSON.stringify(data.debug));
+      console.log(`   Samples:`, JSON.stringify(data.samples).slice(0, 800));
     }
 
     cache = {
@@ -179,16 +251,17 @@ async function scrapeResults() {
 
 async function autoRefresh() {
   try { await scrapeResults(); } catch (e) { console.error("Auto-refresh:", e.message); }
-  setTimeout(autoRefresh, 8000);
+  setTimeout(autoRefresh, 5000); // faster: every 5 seconds
 }
 
-app.get("/", (req, res) => res.json({ status: "ok", target: TARGET_URL, version: "v5" }));
+app.get("/", (req, res) => res.json({ status: "ok", target: TARGET_URL, version: "v6" }));
 app.get("/api/results", (req, res) => res.json(cache));
 app.get("/api/refresh", async (req, res) => res.json(await scrapeResults()));
 app.get("/api/health", (req, res) => res.json({ status: "ok", uptime: process.uptime(), lastUpdate: cache.lastUpdate, resultsCount: cache.results.length }));
 
 app.listen(PORT, () => {
-  console.log(`🎰 Crazy Time scraper v5 running on port ${PORT}`);
+  console.log(`🎰 Crazy Time scraper v6 running on port ${PORT}`);
+  console.log(`📡 Targeting: ${TARGET_URL}`);
   setTimeout(autoRefresh, 2000);
 });
 
