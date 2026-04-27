@@ -1,7 +1,11 @@
 // ═══════════════════════════════════════════════════════════
-//  Crazy Time Live Scraper Server (v4)
-//  CRITICAL FIX: reads SLOT RESULT (the actual wheel landing)
-//  not "Spin Result" (which is post-bonus payout description).
+//  Crazy Time Live Scraper Server (v5)
+//  KEY FIX: parses 'ico-crazytime-slot-X' class names correctly:
+//    slot-1, slot-2, slot-5, slot-10 → number
+//    slot-ct → Crazy Time
+//    slot-cf → Coin Flip
+//    slot-ch → Cash Hunt
+//    slot-pa → Pachinko
 // ═══════════════════════════════════════════════════════════
 
 const express = require("express");
@@ -45,90 +49,73 @@ async function scrapeResults() {
     await new Promise(r => setTimeout(r, 5500));
 
     const data = await page.evaluate(() => {
-      // Detect from cell — VERY conservative, requires explicit match
+      // PRIMARY DETECTION: parse the slot class name
+      // Examples: "ico-crazytime-slot-1", "ico-crazytime-slot-ct", "ico-crazytime-slot-cf"
       function detectFromCell(cell) {
         if (!cell) return { result: null, raw: "" };
 
-        // Gather every clue
-        const clues = [];
-        const text = (cell.textContent || "").trim();
-        if (text) clues.push("TEXT:" + text);
-
-        const imgs = cell.querySelectorAll("img");
-        for (const img of imgs) {
-          if (img.alt) clues.push("ALT:" + img.alt);
-          if (img.title) clues.push("TITLE:" + img.title);
-          if (img.src) clues.push("SRC:" + img.src);
-        }
-
-        const allChildren = cell.querySelectorAll("*");
-        for (const c of allChildren) {
-          const bg = window.getComputedStyle(c).backgroundImage;
-          if (bg && bg !== "none") clues.push("BG:" + bg);
-          if (c.className && typeof c.className === "string" && c.className.length < 100) clues.push("CLS:" + c.className);
-          if (c.dataset) {
-            for (const k of Object.keys(c.dataset)) clues.push("DATA:" + k + "=" + c.dataset[k]);
+        // Look for any element with class containing "ico-crazytime-slot-X"
+        const allEls = cell.querySelectorAll("*");
+        let foundClass = "";
+        for (const el of allEls) {
+          if (el.className && typeof el.className === "string") {
+            const m = el.className.match(/ico-crazytime-slot-([a-z0-9]+)/i);
+            if (m) {
+              foundClass = m[0];
+              const code = m[1].toLowerCase();
+              const result = mapSlotCode(code);
+              if (result) {
+                return { result, raw: foundClass };
+              }
+            }
           }
         }
 
-        const all = clues.join(" || ").toLowerCase();
-        const result = matchResult(all, text);
-        return { result, raw: clues.slice(0, 6).join(" || ").slice(0, 250) };
-      }
-
-      function matchResult(all, originalText) {
-        if (!all) return null;
-
-        // Bonus games: must have explicit indicator (longer names checked first)
-        if (/(?:^|[^a-z])crazy[\s_-]*time(?:[^a-z]|$)/i.test(all) || /ico-crazytime/.test(all) || /crazytime\b/.test(all)) return "Crazy Time";
-        if (/(?:^|[^a-z])coin[\s_-]*flip(?:[^a-z]|$)/i.test(all) || /ico-coinflip/.test(all) || /coinflip\b/.test(all)) return "Coin Flip";
-        if (/(?:^|[^a-z])cash[\s_-]*hunt(?:[^a-z]|$)/i.test(all) || /ico-cashhunt/.test(all) || /cashhunt\b/.test(all)) return "Cash Hunt";
-        if (/(?:^|[^a-z])pachinko(?:[^a-z]|$)/i.test(all) || /ico-pachinko/.test(all)) return "Pachinko";
-
-        // Numbers — STRICT: prefer the cell's plain text first
-        if (originalText) {
-          const t = originalText.trim();
-          if (/^10$/.test(t)) return "10";
-          if (/^5$/.test(t)) return "5";
-          if (/^2$/.test(t)) return "2";
-          if (/^1$/.test(t)) return "1";
+        // Fallback: parse image src for "/slot-X.webp"
+        const imgs = cell.querySelectorAll("img");
+        for (const img of imgs) {
+          const src = img.src || "";
+          const m = src.match(/\/slot-([a-z0-9]+)\.(?:webp|png|svg|jpg)/i);
+          if (m) {
+            const result = mapSlotCode(m[1].toLowerCase());
+            if (result) return { result, raw: src };
+          }
         }
 
-        // From src/icon filenames — be strict, require "ico-N" or similar
-        const ico = all.match(/ico-(\d+)/);
-        if (ico && ["1","2","5","10"].includes(ico[1])) return ico[1];
-        // url(.../N.webp) or url(.../N.png)
-        const numUrl = all.match(/\/(\d+)\.(webp|png|svg|jpg)/);
-        if (numUrl && ["1","2","5","10"].includes(numUrl[1])) return numUrl[1];
-        // class name like "result-5" or "spin-10"
-        const clsNum = all.match(/(?:result|slot|spin|seg|num)[-_](\d+)/);
-        if (clsNum && ["1","2","5","10"].includes(clsNum[1])) return clsNum[1];
-
-        return null;
+        // No match
+        return { result: null, raw: cell.textContent.trim().slice(0, 50) };
       }
 
-      // Find target table
+      function mapSlotCode(code) {
+        const map = {
+          "1": "1", "2": "2", "5": "5", "10": "10",
+          "ct": "Crazy Time",
+          "cf": "Coin Flip",
+          "ch": "Cash Hunt",
+          "pa": "Pachinko",
+        };
+        return map[code] || null;
+      }
+
+      // Find target table (it has 'Slot Result' header)
       const tables = document.querySelectorAll("table");
       let targetTable = null;
       for (const tbl of tables) {
         const headers = Array.from(tbl.querySelectorAll("th, thead td")).map(h => h.textContent.toLowerCase());
-        if (headers.some(h => h.includes("slot result")) || headers.some(h => h.includes("occurred"))) {
+        if (headers.some(h => h.includes("slot result"))) {
           targetTable = tbl; break;
         }
       }
       if (!targetTable) return { items: [], debug: { error: "No matching table" }, samples: [] };
 
-      // Find columns — PREFER "Slot Result" (the actual wheel landing)
+      // Find columns
       const headerCells = Array.from(targetTable.querySelectorAll("th, thead td"));
-      let timeCol = -1, slotCol = -1, spinCol = -1;
+      let timeCol = -1, slotCol = -1;
       headerCells.forEach((h, i) => {
         const t = h.textContent.toLowerCase();
         if (t.includes("occurred") || (t.includes("time") && timeCol === -1)) timeCol = i;
-        if (t.includes("slot result")) slotCol = i;       // ✅ THE ACTUAL RESULT
-        if (t.includes("spin result")) spinCol = i;       // (post-bonus, ignore)
+        if (t.includes("slot result")) slotCol = i;
       });
-
-      const useCol = slotCol !== -1 ? slotCol : spinCol;
 
       const rows = targetTable.querySelectorAll("tbody tr");
       const out = [];
@@ -139,21 +126,16 @@ async function scrapeResults() {
         if (cells.length === 0) continue;
 
         const timeText = timeCol >= 0 && cells[timeCol] ? cells[timeCol].textContent.trim() : "";
-        const targetCell = useCol >= 0 ? cells[useCol] : null;
-        const det = detectFromCell(targetCell);
+        const slotCell = slotCol >= 0 ? cells[slotCol] : null;
+        const det = detectFromCell(slotCell);
 
-        // Save first 3 rows as debug samples
-        if (i < 3 && targetCell) {
+        if (i < 3 && slotCell) {
           samples.push({
-            rowIdx: i,
+            row: i,
             time: timeText,
-            cellHTML: targetCell.outerHTML.slice(0, 350),
-            cellText: targetCell.textContent.trim(),
-            imgCount: targetCell.querySelectorAll("img").length,
-            firstImgSrc: (targetCell.querySelector("img") || {}).src || "",
-            firstImgAlt: (targetCell.querySelector("img") || {}).alt || "",
+            cellHTML: slotCell.outerHTML.slice(0, 250),
             detected: det.result,
-            rawClues: det.raw,
+            classFound: det.raw,
           });
         }
 
@@ -163,18 +145,18 @@ async function scrapeResults() {
 
       return {
         items: out,
-        debug: {
-          tableCount: tables.length, rowCount: rows.length,
-          timeCol, slotCol, spinCol, useCol,
-          headers: headerCells.map(h => h.textContent.trim()),
-        },
+        debug: { tableCount: tables.length, rowCount: rows.length, timeCol, slotCol },
         samples,
       };
     });
 
     console.log(`✅ Scraped ${data.items.length} results`);
+    if (data.items.length > 0) {
+      const summary = data.items.map(r => r.result).join(", ");
+      console.log(`   Results: ${summary}`);
+    }
     if (data.samples && data.samples.length) {
-      console.log(`   Samples:`, JSON.stringify(data.samples).slice(0, 800));
+      console.log(`   Samples:`, JSON.stringify(data.samples).slice(0, 600));
     }
 
     cache = {
@@ -200,13 +182,13 @@ async function autoRefresh() {
   setTimeout(autoRefresh, 8000);
 }
 
-app.get("/", (req, res) => res.json({ status: "ok", target: TARGET_URL, version: "v4" }));
+app.get("/", (req, res) => res.json({ status: "ok", target: TARGET_URL, version: "v5" }));
 app.get("/api/results", (req, res) => res.json(cache));
 app.get("/api/refresh", async (req, res) => res.json(await scrapeResults()));
 app.get("/api/health", (req, res) => res.json({ status: "ok", uptime: process.uptime(), lastUpdate: cache.lastUpdate, resultsCount: cache.results.length }));
 
 app.listen(PORT, () => {
-  console.log(`🎰 Crazy Time scraper v4 running on port ${PORT}`);
+  console.log(`🎰 Crazy Time scraper v5 running on port ${PORT}`);
   setTimeout(autoRefresh, 2000);
 });
 
