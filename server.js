@@ -1,7 +1,7 @@
 // ═══════════════════════════════════════════════════════════
-//  Crazy Time Live Scraper Server (v6)
-//  NEW SOURCE: https://in.casino.org/india/casinoscores/crazy-time/
-//  Returns rich debug info on first run so we can dial in selectors.
+//  Crazy Time Live Scraper Server (v7)
+//  STRATEGY: Intercept API/WebSocket traffic on casino.org
+//  This catches the live data feed they use internally.
 // ═══════════════════════════════════════════════════════════
 
 const express = require("express");
@@ -10,259 +10,235 @@ const puppeteer = require("puppeteer");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const TARGET_URL = "https://in.casino.org/india/casinoscores/crazy-time/";
+const TARGET_URL = "https://www.casino.org/casinoscores/crazy-time/";
 
 app.use(cors());
 app.use(express.json());
 
-let cache = { results: [], lastUpdate: null, error: null, debug: null };
+let cache = {
+  lastResult: null,         // { result, time }
+  lastUpdate: null,
+  error: null,
+  capturedURLs: [],         // for debugging — what API endpoints we found
+  rawHistory: [],           // last 30 results
+};
+
 let browser = null;
-let scrapingInProgress = false;
+let monitorPage = null;
+let monitorRunning = false;
+
+// Map raw outcome strings/codes from casino.org to our standard names
+function mapOutcome(raw) {
+  if (!raw) return null;
+  const s = String(raw).trim().toLowerCase();
+  if (s === "1" || s === "one") return "1";
+  if (s === "2" || s === "two") return "2";
+  if (s === "5" || s === "five") return "5";
+  if (s === "10" || s === "ten") return "10";
+  if (/crazy[\s_-]*time|crazytime/.test(s)) return "Crazy Time";
+  if (/coin[\s_-]*flip|coinflip/.test(s)) return "Coin Flip";
+  if (/cash[\s_-]*hunt|cashhunt/.test(s)) return "Cash Hunt";
+  if (/pachinko/.test(s)) return "Pachinko";
+  return null;
+}
+
+// Parse JSON response body looking for spin results
+function tryExtractFromJSON(jsonText, sourceUrl) {
+  try {
+    const data = JSON.parse(jsonText);
+    return walkForResults(data, sourceUrl);
+  } catch (e) {
+    return [];
+  }
+}
+
+function walkForResults(obj, sourceUrl, depth = 0) {
+  if (depth > 6 || !obj) return [];
+  const results = [];
+
+  // If it's an array, check each item
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      if (typeof item === "object" && item !== null) {
+        // Common fields casino tracker APIs use
+        const result = mapOutcome(
+          item.result || item.outcome || item.slot_result ||
+          item.slotResult || item.spin_result || item.spinResult ||
+          item.value || item.winningSegment || item.segment ||
+          item.symbol || item.name
+        );
+        if (result) {
+          const time = item.timestamp || item.time || item.finished ||
+                       item.finishedAt || item.startedAt || item.created || "";
+          results.push({ result, time: String(time), source: sourceUrl });
+          continue;
+        }
+        // Recurse if no direct match
+        const nested = walkForResults(item, sourceUrl, depth + 1);
+        if (nested.length) results.push(...nested);
+      }
+    }
+    return results;
+  }
+
+  // Object — check fields and recurse
+  if (typeof obj === "object") {
+    for (const key of Object.keys(obj)) {
+      const val = obj[key];
+      if (Array.isArray(val) || (typeof val === "object" && val !== null)) {
+        const sub = walkForResults(val, sourceUrl, depth + 1);
+        if (sub.length) results.push(...sub);
+      }
+    }
+  }
+  return results;
+}
 
 async function getBrowser() {
   if (browser && browser.connected) return browser;
   console.log("🚀 Launching headless Chrome...");
   browser = await puppeteer.launch({
     headless: "new",
-    args: ["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage","--disable-gpu","--no-first-run","--single-process"],
+    args: ["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage","--disable-gpu","--no-first-run"],
   });
   return browser;
 }
 
-function mapToken(token) {
-  if (!token) return null;
-  const t = String(token).trim().toLowerCase();
-
-  // Bonus games
-  if (/(crazy[\s_-]*time|crazytime)/.test(t)) return "Crazy Time";
-  if (/(coin[\s_-]*flip|coinflip)/.test(t)) return "Coin Flip";
-  if (/(cash[\s_-]*hunt|cashhunt)/.test(t)) return "Cash Hunt";
-  if (/pachinko/.test(t)) return "Pachinko";
-
-  // Numbers — exact match only
-  if (/^10$/.test(t)) return "10";
-  if (/^5$/.test(t)) return "5";
-  if (/^2$/.test(t)) return "2";
-  if (/^1$/.test(t)) return "1";
-
-  return null;
-}
-
-async function scrapeResults() {
-  if (scrapingInProgress) return cache;
-  scrapingInProgress = true;
-  let page = null;
+async function startMonitor() {
+  if (monitorRunning) return;
+  monitorRunning = true;
 
   try {
     const br = await getBrowser();
-    page = await br.newPage();
-    await page.setUserAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-    await page.setViewport({ width: 1280, height: 900 });
+    monitorPage = await br.newPage();
+    await monitorPage.setUserAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+    await monitorPage.setViewport({ width: 1280, height: 900 });
 
-    console.log(`🔍 Navigating to ${TARGET_URL}...`);
-    await page.goto(TARGET_URL, { waitUntil: "networkidle2", timeout: 30000 });
-    await new Promise(r => setTimeout(r, 6000));
+    // Hook into ALL network responses
+    monitorPage.on("response", async (response) => {
+      const url = response.url();
+      const ct = response.headers()["content-type"] || "";
 
-    const data = await page.evaluate(() => {
-      const out = [];
-      const samples = [];
+      // Only care about JSON responses (likely API)
+      if (!ct.includes("json")) return;
+      // Skip obvious non-game endpoints
+      if (/\.(png|jpg|webp|svg|css|woff)/.test(url)) return;
+      if (/google|facebook|gtag|analytics|sentry|cloudflare/.test(url)) return;
 
-      // Helper: detect from anything
-      function detectFromEl(el) {
-        if (!el) return { result: null, raw: "" };
-        const clues = [];
-        const text = (el.textContent || "").trim();
-        if (text) clues.push(text);
-        if (el.alt) clues.push(el.alt);
-        if (el.title) clues.push(el.title);
-        if (el.src) clues.push(el.src);
-        if (el.className && typeof el.className === "string") clues.push(el.className);
-        if (el.dataset) {
-          for (const k of Object.keys(el.dataset)) clues.push(el.dataset[k]);
-        }
-        // Children
-        const imgs = el.querySelectorAll ? el.querySelectorAll("img") : [];
-        for (const img of imgs) {
-          if (img.alt) clues.push(img.alt);
-          if (img.src) clues.push(img.src);
-        }
-        const allChildren = el.querySelectorAll ? el.querySelectorAll("*") : [];
-        for (const c of allChildren) {
-          if (c.className && typeof c.className === "string" && c.className.length < 80) clues.push(c.className);
-          const bg = window.getComputedStyle(c).backgroundImage;
-          if (bg && bg !== "none") clues.push(bg);
-        }
-        return { result: null, clues: clues.slice(0, 8), raw: clues.slice(0, 4).join(" || ").slice(0, 200) };
-      }
+      try {
+        const text = await response.text();
+        if (text.length < 30 || text.length > 200000) return;
 
-      // ==== Strategy 1: Find a results table with Spin/Slot Result column ====
-      const tables = document.querySelectorAll("table");
-      let bestTable = null;
-      for (const tbl of tables) {
-        const headers = Array.from(tbl.querySelectorAll("th, thead td")).map(h => h.textContent.toLowerCase());
-        if (headers.some(h => h.includes("result") || h.includes("spin") || h.includes("slot") || h.includes("outcome"))) {
-          bestTable = tbl;
-          break;
-        }
-      }
+        const found = tryExtractFromJSON(text, url);
+        if (found.length > 0) {
+          // Track the source URL once
+          if (!cache.capturedURLs.includes(url)) {
+            cache.capturedURLs.push(url);
+            if (cache.capturedURLs.length > 5) cache.capturedURLs.shift();
+            console.log(`🎯 Found data feed: ${url.slice(0, 100)}`);
+          }
 
-      if (bestTable) {
-        const headerCells = Array.from(bestTable.querySelectorAll("th, thead td"));
-        const headersStr = headerCells.map(h => h.textContent.trim());
-
-        const rows = bestTable.querySelectorAll("tbody tr");
-        for (let i = 0; i < rows.length; i++) {
-          const cells = Array.from(rows[i].querySelectorAll("td"));
-          if (cells.length === 0) continue;
-
-          // Try every cell to find a result match
-          let foundResult = null, foundIn = -1, foundClues = "";
-          for (let c = 0; c < cells.length; c++) {
-            const det = (function(cell){
-              if (!cell) return null;
-              const els = [cell, ...cell.querySelectorAll("*")];
-              for (const el of els) {
-                const tries = [];
-                if (el.alt) tries.push(el.alt);
-                if (el.title) tries.push(el.title);
-                if (el.src) tries.push(el.src);
-                if (el.className && typeof el.className === "string") tries.push(el.className);
-                if (el.dataset) for (const k of Object.keys(el.dataset)) tries.push(el.dataset[k]);
-                for (const t of tries) {
-                  // From class names like "result-1", "outcome-coinflip", "icon-crazy-time"
-                  const match = String(t).toLowerCase();
-                  if (/crazy[\s_-]*time|crazytime/.test(match)) return "Crazy Time";
-                  if (/coin[\s_-]*flip|coinflip/.test(match)) return "Coin Flip";
-                  if (/cash[\s_-]*hunt|cashhunt/.test(match)) return "Cash Hunt";
-                  if (/pachinko/.test(match)) return "Pachinko";
-                  // From URLs / class endings: -1, -2, -5, -10
-                  const numFromAttr = match.match(/(?:result|outcome|slot|spin|seg|number|num)[-_](\d+)/);
-                  if (numFromAttr && ["1","2","5","10"].includes(numFromAttr[1])) return numFromAttr[1];
-                  const slotFromUrl = match.match(/\/(\d+)\.(webp|png|svg|jpg)/);
-                  if (slotFromUrl && ["1","2","5","10"].includes(slotFromUrl[1])) return slotFromUrl[1];
-                }
-              }
-              // Plain text fallback
-              const text = (cell.textContent || "").trim();
-              if (/^(crazy\s*time|coin\s*flip|cash\s*hunt|pachinko)$/i.test(text)) {
-                if (/crazy/i.test(text)) return "Crazy Time";
-                if (/coin/i.test(text)) return "Coin Flip";
-                if (/cash/i.test(text)) return "Cash Hunt";
-                if (/pachinko/i.test(text)) return "Pachinko";
-              }
-              if (/^(10|5|2|1)$/.test(text)) return text;
-              return null;
-            })(cells[c]);
-            if (det) {
-              foundResult = det;
-              foundIn = c;
-              break;
+          // Update history with new results (newest first)
+          for (const r of found) {
+            const key = `${r.result}|${r.time}`;
+            const existing = cache.rawHistory.find(h => `${h.result}|${h.time}` === key);
+            if (!existing) {
+              cache.rawHistory.unshift({ result: r.result, time: r.time });
             }
           }
+          cache.rawHistory = cache.rawHistory.slice(0, 30);
 
-          // Time: usually leftmost column or one labeled "time"/"finished"
-          let timeText = "";
-          const timeIdx = headersStr.findIndex(h => /time|finished|when|occurred/i.test(h));
-          if (timeIdx >= 0 && cells[timeIdx]) {
-            timeText = cells[timeIdx].textContent.trim();
-          } else if (cells[0]) {
-            timeText = cells[0].textContent.trim();
+          if (cache.rawHistory.length > 0) {
+            cache.lastResult = cache.rawHistory[0];
+            cache.lastUpdate = new Date().toISOString();
+            cache.error = null;
+            console.log(`✅ ${cache.rawHistory[0].result} @ ${cache.rawHistory[0].time}`);
           }
-
-          if (i < 4) {
-            samples.push({
-              row: i,
-              time: timeText,
-              cellCount: cells.length,
-              cellsHTML: cells.map(c => c.outerHTML.slice(0, 200)),
-              detected: foundResult,
-              detectedInCol: foundIn,
-            });
-          }
-
-          if (foundResult) out.push({ result: foundResult, time: timeText });
-          if (out.length >= 30) break;
         }
-
-        return {
-          items: out,
-          debug: {
-            strategy: "table",
-            url: location.href,
-            title: document.title,
-            tableCount: tables.length,
-            rowCount: rows.length,
-            headers: headersStr,
-          },
-          samples,
-        };
+      } catch (e) {
+        // Ignore parsing errors
       }
-
-      // ==== Strategy 2: card/list layout (no table) ====
-      // Look for repeated elements that contain result info
-      const candidates = document.querySelectorAll("[class*='result'], [class*='spin'], [class*='outcome'], [class*='history'] > *, [class*='round']");
-      const listSamples = [];
-      for (const c of Array.from(candidates).slice(0, 30)) {
-        const text = (c.textContent || "").trim();
-        if (text.length > 100 || text.length < 1) continue;
-        listSamples.push({ class: c.className, text: text.slice(0, 80), html: c.outerHTML.slice(0, 200) });
-        if (listSamples.length >= 5) break;
-      }
-
-      return {
-        items: [],
-        debug: {
-          strategy: "fallback",
-          url: location.href,
-          title: document.title,
-          tableCount: tables.length,
-          bodyHasText: (document.body.textContent || "").length,
-          listCandidates: candidates.length,
-        },
-        samples: listSamples,
-      };
     });
 
-    console.log(`✅ Scraped ${data.items.length} results`);
-    if (data.items.length > 0) {
-      console.log(`   Latest: ${data.items.slice(0, 5).map(r => `${r.result}@${r.time}`).join(" | ")}`);
-    } else {
-      console.log(`   Debug:`, JSON.stringify(data.debug));
-      console.log(`   Samples:`, JSON.stringify(data.samples).slice(0, 800));
-    }
+    // Also log WebSocket frames
+    const client = await monitorPage.target().createCDPSession();
+    await client.send("Network.enable");
+    client.on("Network.webSocketFrameReceived", ({ response }) => {
+      try {
+        const payload = response.payloadData;
+        if (!payload || payload.length < 20) return;
+        const found = tryExtractFromJSON(payload, "websocket");
+        if (found.length > 0) {
+          if (!cache.capturedURLs.includes("websocket")) {
+            cache.capturedURLs.push("websocket");
+            console.log(`🎯 Live WebSocket data feed detected!`);
+          }
+          for (const r of found) {
+            const key = `${r.result}|${r.time}`;
+            const existing = cache.rawHistory.find(h => `${h.result}|${h.time}` === key);
+            if (!existing) {
+              cache.rawHistory.unshift({ result: r.result, time: r.time });
+            }
+          }
+          cache.rawHistory = cache.rawHistory.slice(0, 30);
+          if (cache.rawHistory.length > 0) {
+            cache.lastResult = cache.rawHistory[0];
+            cache.lastUpdate = new Date().toISOString();
+            console.log(`📡 (WS) ${cache.rawHistory[0].result} @ ${cache.rawHistory[0].time}`);
+          }
+        }
+      } catch (e) {}
+    });
 
-    cache = {
-      results: data.items,
-      lastUpdate: new Date().toISOString(),
-      error: data.items.length === 0 ? `No results extracted` : null,
-      debug: data.debug,
-      samples: data.samples,
-    };
+    console.log(`🔍 Loading ${TARGET_URL} and monitoring all network traffic...`);
+    await monitorPage.goto(TARGET_URL, { waitUntil: "networkidle2", timeout: 45000 });
+    console.log(`✅ Page loaded. Now passively monitoring for live updates.`);
+
+    // Keep page alive — refresh every 5 min so it doesn't get stale
+    setInterval(async () => {
+      try {
+        if (monitorPage && !monitorPage.isClosed()) {
+          console.log("🔄 Refreshing monitor page...");
+          await monitorPage.reload({ waitUntil: "networkidle2", timeout: 30000 });
+        }
+      } catch (e) { console.error("Refresh failed:", e.message); }
+    }, 5 * 60 * 1000);
+
   } catch (err) {
-    console.error("❌ Scrape failed:", err.message);
+    console.error("❌ Monitor failed:", err.message);
     cache.error = err.message;
-    cache.lastUpdate = new Date().toISOString();
-  } finally {
-    if (page) await page.close().catch(() => {});
-    scrapingInProgress = false;
+    monitorRunning = false;
   }
-  return cache;
 }
 
-async function autoRefresh() {
-  try { await scrapeResults(); } catch (e) { console.error("Auto-refresh:", e.message); }
-  setTimeout(autoRefresh, 5000); // faster: every 5 seconds
-}
+// API endpoints
+app.get("/", (req, res) => res.json({
+  status: "ok",
+  target: TARGET_URL,
+  version: "v7-intercept",
+  monitoring: monitorRunning,
+}));
 
-app.get("/", (req, res) => res.json({ status: "ok", target: TARGET_URL, version: "v6" }));
-app.get("/api/results", (req, res) => res.json(cache));
-app.get("/api/refresh", async (req, res) => res.json(await scrapeResults()));
-app.get("/api/health", (req, res) => res.json({ status: "ok", uptime: process.uptime(), lastUpdate: cache.lastUpdate, resultsCount: cache.results.length }));
+app.get("/api/results", (req, res) => res.json({
+  results: cache.rawHistory,
+  lastResult: cache.lastResult,
+  lastUpdate: cache.lastUpdate,
+  error: cache.error,
+  capturedURLs: cache.capturedURLs,
+}));
+
+app.get("/api/health", (req, res) => res.json({
+  status: "ok",
+  uptime: process.uptime(),
+  lastUpdate: cache.lastUpdate,
+  resultCount: cache.rawHistory.length,
+  capturedFeeds: cache.capturedURLs.length,
+}));
 
 app.listen(PORT, () => {
-  console.log(`🎰 Crazy Time scraper v6 running on port ${PORT}`);
-  console.log(`📡 Targeting: ${TARGET_URL}`);
-  setTimeout(autoRefresh, 2000);
+  console.log(`🎰 Crazy Time scraper v7 running on port ${PORT}`);
+  console.log(`📡 Will intercept network traffic from: ${TARGET_URL}`);
+  setTimeout(startMonitor, 3000);
 });
 
 process.on("SIGTERM", async () => { if (browser) await browser.close(); process.exit(0); });
